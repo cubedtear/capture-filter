@@ -41,6 +41,9 @@ pub const InterfaceStatisticsBlock = struct {
         var next_option_index: usize = 0;
 
         while (true) {
+            if (reader.underlyingReader().context.pos >= reader.underlyingReader().context.buffer.len - 4) {
+                break;
+            }
             const option_type: ISBOptionType = @enumFromInt(reader.readBitsNoEof(u16, 16) catch break);
             const option_length = try reader.readBitsNoEof(u16, 16);
 

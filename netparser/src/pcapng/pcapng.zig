@@ -27,24 +27,37 @@ pub const PcapngParser = struct {
         };
     }
 
-    pub fn get_next_block_slice(self: *PcapngParser) ?[]u8 {
+    const BlockSlice = struct {
+        block_type: BlockType,
+        slice: []u8,
+    };
+
+    pub fn get_next_block_slice(self: *PcapngParser) ?BlockSlice {
         if (self.current_offset >= self.file_data.len) {
             return null;
         }
 
-        // const block_type = @as(*BlockType, @alignCast(@ptrCast(self.file_data.ptr + self.current_offset))).*;
+        const block_type = @as(*BlockType, @alignCast(@ptrCast(self.file_data.ptr + self.current_offset))).*;
         const block_total_length = @as(*u32, @alignCast(@ptrCast(self.file_data.ptr + self.current_offset + @sizeOf(u32)))).*;
 
-        return self.file_data[self.current_offset .. self.current_offset + block_total_length];
+        const block_start_addr = self.current_offset;
+
+        self.current_offset += block_total_length;
+
+        return .{
+            .block_type = block_type,
+            .slice = self.file_data[block_start_addr .. block_start_addr + block_total_length]
+        };
     }
 
-    pub fn parse_block_slice(self: *PcapngParser, allocator: Allocator, block_slice: []u8) !?Block {
-        std.debug.assert(block_slice.ptr >= self.file_data.ptr and block_slice.ptr + block_slice.len <= self.file_data.ptr + self.file_data.len);
+    pub fn parse_block_slice(self: *PcapngParser, block_slice: []u8) !?Block {
+        // Check that the block slice is within the bounds of the file data
+        std.debug.assert(@intFromPtr(block_slice.ptr) >= @intFromPtr(self.file_data.ptr) and @intFromPtr(block_slice.ptr + block_slice.len) <= @intFromPtr(self.file_data.ptr + self.file_data.len));
 
         const block_type = @as(*BlockType, @alignCast(@ptrCast(block_slice.ptr))).*;
 
         if (block_type == BlockType.SectionHeaderBlock) {
-            const byte_order_magic: *u32 = @alignCast(@ptrCast(block_slice[0..4].ptr));
+            const byte_order_magic: *u32 = @alignCast(@ptrCast(block_slice.ptr + 8));
 
             self.section_endian = try blk: {
                 if (byte_order_magic.* == 0x1a2b3c4d) {
@@ -59,22 +72,22 @@ pub const PcapngParser = struct {
 
         std.debug.assert(self.section_endian != null);
 
-        var fbs = std.io.fixedBufferStream(block_slice);
+        var fbs = std.io.fixedBufferStream(block_slice[8..]);
         var bit_reader: BitReader(std.io.FixedBufferStream([]u8).Reader) = bitReader(self.section_endian orelse unreachable, fbs.reader());
 
         // std.debug.print("Block Type: {} - Block Total Length: {}\n", .{ block_type, block_total_length });
 
         const block_body: BlockBody = switch (block_type) {
-            .SectionHeaderBlock => BlockBody{ .SectionHeaderBlock = (try SectionHeaderBlock.parse(allocator, &bit_reader)).? },
-            .InterfaceDescriptionBlock => BlockBody{ .InterfaceDescriptionBlock = (try InterfaceDescriptionBlock.parse(allocator, &bit_reader)).? },
-            .EnhancedPacketBlock => BlockBody{ .EnhancedPacketBlock = (try EnhancedPacketBlock.parse(allocator, &bit_reader)).? },
-            .InterfaceStatisticsBlock => BlockBody{ .InterfaceStatisticsBlock = (try InterfaceStatisticsBlock.parse(allocator, &bit_reader)).? },
+            .SectionHeaderBlock => BlockBody{ .SectionHeaderBlock = (try SectionHeaderBlock.parse(&bit_reader)).? },
+            .InterfaceDescriptionBlock => BlockBody{ .InterfaceDescriptionBlock = (try InterfaceDescriptionBlock.parse(&bit_reader)).? },
+            .EnhancedPacketBlock => BlockBody{ .EnhancedPacketBlock = (try EnhancedPacketBlock.parse(&bit_reader)).? },
+            .InterfaceStatisticsBlock => BlockBody{ .InterfaceStatisticsBlock = (try InterfaceStatisticsBlock.parse(&bit_reader)).? },
             else => std.debug.panic("Unknown block type {} found", .{block_type}),
         };
 
         return Block{
             .block_type = block_type,
-            .block_total_length = block_slice.len,
+            .block_total_length = @intCast(block_slice.len), // Block size cannot exceed std.math.maxInt(u32) per the pcapng spec
             .body = block_body,
         };
     }

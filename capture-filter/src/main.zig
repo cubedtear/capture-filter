@@ -100,6 +100,8 @@ const Surface = struct {
 };
 
 pub fn main() !void {
+    const startup_instant = try std.time.Instant.now();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{
         // .stack_trace_frames = 20,
         // .retain_metadata = true,
@@ -109,12 +111,46 @@ pub fn main() !void {
     // const alloc = logging_gpa.allocator();
     const alloc = gpa.allocator();
 
-    // const file_data = try mmapped_file.map_file("test_null.pcapng");
-    // const file_data = try mmapped_file.map_file("test_eth.pcapng");
-    // const file_data = try mmapped_file.map_file("test_eth_2_ipv6.pcapng");
-    const file_data = try mmapped_file.map_file("test_huge.pcapng");
+    const input_file_path = blk: {
+        var args = try std.process.argsWithAllocator(alloc);
+        defer args.deinit();
 
-    std.debug.print("Mapped file size: {}\n", .{file_data.len});
+        _ = args.skip(); // Skip the executable name.
+
+        const arg = args.next() orelse return std.debug.panic("Missing input file path.\n", .{});
+
+        break :blk try alloc.dupe(u8, arg);
+    };
+    defer alloc.free(input_file_path);
+
+    std.log.info("[capture-filter] Input file path: {s}", .{input_file_path});
+
+    const file_data = mmapped_file.map_file(input_file_path) catch |err| {
+        return std.debug.panic("Failed to map file: {}\n", .{err});
+    };
+
+    // Convert file_data.len from bytes to the appropriate unit (KiB, MiB, GiB, etc.), such that the unit is the largest possible without exceeding 1024.
+    const file_size_str = blk: {
+        const KiB = 1024;
+        const MiB = KiB * 1024;
+        const GiB = MiB * 1024;
+        const TiB = GiB * 1024;
+
+        if (file_data.len > TiB) {
+            break :blk try std.fmt.allocPrint(alloc, "{d:.2} TiB", .{@as(f64, @floatFromInt(file_data.len)) / TiB});
+        } else if (file_data.len > GiB) {
+            break :blk try std.fmt.allocPrint(alloc, "{d:.2} GiB", .{@as(f64, @floatFromInt(file_data.len)) / GiB});
+        } else if (file_data.len > MiB) {
+            break :blk try std.fmt.allocPrint(alloc, "{d:.2} MiB", .{@as(f64, @floatFromInt(file_data.len)) / MiB});
+        } else if (file_data.len > KiB) {
+            break :blk try std.fmt.allocPrint(alloc, "{d:.2} KiB", .{@as(f64, @floatFromInt(file_data.len)) / KiB});
+        } else {
+            break :blk try std.fmt.allocPrint(alloc, "{} B", .{file_data.len});
+        }
+    };
+    defer alloc.free(file_size_str);
+
+    std.log.info("[capture-filter] Loaded file size: {s}\n", .{file_size_str});
 
     if (file_data.len < netparser.pcapng.PcapngParser.min_file_size) {
         return std.debug.panic("File is too small to contain a Section Header Block Header.\n", .{});
@@ -122,13 +158,18 @@ pub fn main() !void {
 
     var parser = netparser.pcapng.PcapngParser.init(file_data);
 
-    var interface_list = std.ArrayList(netparser.pcapng.InterfaceDescriptionBlock).init(alloc);
-    defer interface_list.deinit();
+    var section_interface_list = std.ArrayList(std.ArrayList(netparser.pcapng.InterfaceDescriptionBlock)).init(alloc);
+    defer {
+        for (section_interface_list.items) |interfaces| {
+            interfaces.deinit();
+        }
+        section_interface_list.deinit();
+    }
 
     const PacketData = struct {
         packet_index: usize,
-        epb: netparser.pcapng.EnhancedPacketBlock,
-        // packet: netparser.link.LinkLayerPayload,
+        block_data: []u8,
+        interfaces_list_index: usize,
     };
 
     var packet_list = std.ArrayList(PacketData).init(alloc);
@@ -136,30 +177,28 @@ pub fn main() !void {
 
     var i: u64 = 0;
     while (true) {
-        const block = try parser.parse_block() orelse break;
+        const block_slice = parser.get_next_block_slice() orelse break;
 
-        if (block.block_type == netparser.pcapng.BlockType.InterfaceDescriptionBlock) {
-            try interface_list.append(block.body.InterfaceDescriptionBlock);
+        if (block_slice.block_type == netparser.pcapng.BlockType.InterfaceDescriptionBlock) {
+            const idb_block = try parser.parse_block_slice(block_slice.slice) orelse continue;
+            try section_interface_list.items[section_interface_list.items.len - 1].append(idb_block.body.InterfaceDescriptionBlock);
         }
 
-        if (block.block_type == netparser.pcapng.BlockType.SectionHeaderBlock) {
-            interface_list.clearRetainingCapacity();
+        if (block_slice.block_type == netparser.pcapng.BlockType.SectionHeaderBlock) {
+            try section_interface_list.append(std.ArrayList(netparser.pcapng.InterfaceDescriptionBlock).init(alloc));
+            // Parse the Section Header Block options, which sets the endian on the parser. Ignore the result.
+            _ = try parser.parse_block_slice(block_slice.slice) orelse continue;
         }
 
-        if (block.block_type == netparser.pcapng.BlockType.EnhancedPacketBlock) {
-            const epb = block.body.EnhancedPacketBlock;
-
+        if (block_slice.block_type == netparser.pcapng.BlockType.EnhancedPacketBlock) {
             try packet_list.append(.{
                 .packet_index = i,
-                .epb = epb,
-                // .packet = link_layer_payload,
+                .block_data = block_slice.slice,
+                .interfaces_list_index = section_interface_list.items.len - 1,
             });
         }
 
         i += 1;
-        if (i % 100000 == 0) {
-            _ = try std.io.getStdOut().writer().print("{} - {}\n", .{ i, block.block_type });
-        }
     }
 
     var imgui_gpa = std.heap.GeneralPurposeAllocator(.{
@@ -171,7 +210,7 @@ pub fn main() !void {
     // const imgui_alloc = imgui_logging_gpa.allocator();
     const imgui_alloc = imgui_gpa.allocator();
 
-    _ = try std.io.getStdOut().writer().print("Total blocks: {}\n", .{i});
+    std.log.info("[capture-filter] Total blocks in PCAPNG: {}\n", .{i});
 
     var surface = try Surface.init(imgui_alloc);
 
@@ -182,6 +221,9 @@ pub fn main() !void {
     defer filtered_packets.deinit();
 
     var selected_packet_index_opt: ?usize = null;
+
+    const startup_end_instant = try std.time.Instant.now();
+    std.log.info("[capture-filter] Initialization took: {d:.2}s", .{ @as(f64, @floatFromInt(startup_end_instant.since(startup_instant))) / 1_000_000_000.0 });
 
     while (!surface.window.shouldClose() and surface.window.getKey(.escape) != .press) {
         if (surface.window.getKey(.space) == .press) {
@@ -195,7 +237,7 @@ pub fn main() !void {
 
         zgui.backend.newFrame(fb_width, fb_height);
 
-        _ = zgui.DockSpaceOverViewport(zgui.getMainViewport(), .{
+        _ = zgui.DockSpaceOverViewport(zgui.getStrId("MainDockspace"), zgui.getMainViewport(), .{
             .passthru_central_node = true,
         });
 
@@ -231,7 +273,7 @@ pub fn main() !void {
                 if (filter_dirty or !filter_initialized) {
                     filter_initialized = true;
 
-                    std.debug.print("Applying filter: \"{s}\"\n", .{filter_str_slice});
+                    std.log.info("[capture-filter] Applying filter: '{s}'", .{filter_str_slice});
                     filtered_packets.clearRetainingCapacity();
                     for (packet_list.items, 0..) |*packet, packet_index| {
                         if (filter_str_slice.len == 0) {
@@ -239,10 +281,14 @@ pub fn main() !void {
                             continue;
                         }
 
-                        const epb_ipb = interface_list.items[packet.epb.interface_id];
+                        const epb_block = try parser.parse_block_slice(packet.block_data) orelse continue;
+
+                        const epb = epb_block.body.EnhancedPacketBlock;
+
+                        const epb_ipb = section_interface_list.items[packet.interfaces_list_index].items[epb.interface_id];
                         const link_type = epb_ipb.link_type;
 
-                        var fbs = std.io.fixedBufferStream(packet.epb.packet_data);
+                        var fbs = std.io.fixedBufferStream(epb.packet_data);
                         var bit_reader = netparser.utils.bit_reader.bitReader(.big, fbs.reader().any());
 
                         var link_layer_payload: netparser.link.LinkLayerPayload = switch (link_type) {
@@ -285,6 +331,7 @@ pub fn main() !void {
                             try filtered_packets.append(packet_index);
                         }
                     }
+                    std.log.info("[capture-filter] Filter applied.", .{});
                 }
 
                 const table_visible = zgui.beginTable("table", .{
@@ -327,10 +374,14 @@ pub fn main() !void {
                             const packet_index = filtered_packets.items[filtered_packet_index];
                             const packet_data = packet_list.items[packet_index];
 
-                            const epb_ipb = interface_list.items[packet_data.epb.interface_id];
+                            const epb_block = try parser.parse_block_slice(packet_data.block_data) orelse continue;
+
+                            const epb = epb_block.body.EnhancedPacketBlock;
+
+                            const epb_ipb = section_interface_list.items[packet_data.interfaces_list_index].items[epb.interface_id];
                             const link_type = epb_ipb.link_type;
 
-                            var fbs = std.io.fixedBufferStream(packet_data.epb.packet_data);
+                            var fbs = std.io.fixedBufferStream(epb.packet_data);
                             var bit_reader = netparser.utils.bit_reader.bitReader(.big, fbs.reader().any());
 
                             var link_layer_payload: netparser.link.LinkLayerPayload = switch (link_type) {
@@ -500,12 +551,15 @@ pub fn main() !void {
 
                         zgui.tableHeadersRow();
 
+                        const epb_block = try parser.parse_block_slice(packet_data.block_data) orelse continue;
+                        const epb = epb_block.body.EnhancedPacketBlock;
+
                         var clipper = zgui.ListClipper.init();
-                        const row_count = (packet_data.epb.packet_data.len + 15) / 16;
+                        const row_count = (epb.packet_data.len + 15) / 16;
                         clipper.begin(@intCast(row_count), null);
                         defer clipper.end();
 
-                        const selectable_cell_flags: zgui.SelectableFlags = .{ .span_all_columns = true };
+                        const selectable_cell_flags: zgui.SelectableFlags = .{ .span_all_columns = false };
 
                         while (clipper.step()) {
                             for (@intCast(clipper.DisplayStart)..@intCast(clipper.DisplayEnd)) |row_index| {
@@ -513,10 +567,10 @@ pub fn main() !void {
 
                                 for (0..16) |byte_in_row| {
                                     const byte_index = row_index * 16 + byte_in_row;
-                                    if (byte_index >= packet_data.epb.packet_data.len) {
+                                    if (byte_index >= epb.packet_data.len) {
                                         break;
                                     }
-                                    const byte = packet_data.epb.packet_data[byte_index];
+                                    const byte = epb.packet_data[byte_index];
 
                                     const col_visible = zgui.tableNextColumn();
                                     if (col_visible) {

@@ -1,0 +1,3 @@
+[submodule "capture-filter/libs/zig-gamedev"]
+	path = capture-filter/libs/zig-gamedev
+	url = git@github.com:cubedtear/zig-gamedev.git
