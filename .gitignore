@@ -1,0 +1,15 @@
+# Zig build artifacts
+.zig-cache/
+
+# Compiled binaries
+zig-out
+
+# Editor/IDE specific files
+.vscode/
+.idea/
+
+# Dependency management
+.zig/
+
+# ImGui layout cache file
+imgui.ini
